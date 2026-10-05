@@ -302,7 +302,7 @@ impl<L> HttpTransportClientBuilder<L> {
 
 		if let Some((user, pwd)) = credentials {
 			if !cached_headers.contains_key(hyper::header::AUTHORIZATION) {
-				let digest = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pwd}"));
+				let digest = base64::engine::general_purpose::STANDARD.encode([&user[..], b":", &pwd[..]].concat());
 				cached_headers.insert(
 					hyper::header::AUTHORIZATION,
 					HeaderValue::from_str(&format!("Basic {digest}"))
@@ -326,8 +326,8 @@ struct Target {
 	scheme: String,
 	/// Normalized URL without credentials or fragment.
 	target: String,
-	/// Username and password from the URL's userinfo, if a password was given.
-	credentials: Option<(String, String)>,
+	/// Percent-decoded username and password from the URL's userinfo, if a password was given.
+	credentials: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Parse and normalize the target URL.
@@ -336,8 +336,6 @@ struct Target {
 /// an empty path becomes `/`, and the fragment is dropped. Credentials in the
 /// userinfo are stripped from the target and returned separately, so they can be
 /// sent as a basic authorization header instead.
-///
-/// Credentials are returned as written in the URL, i.e. still percent-encoded.
 fn parse_target(target: &str) -> Result<Target, Error> {
 	let uri: Uri = target.parse().map_err(|e| Error::Url(format!("Invalid URL: {e}")))?;
 
@@ -368,13 +366,41 @@ fn parse_target(target: &str) -> Result<Target, Error> {
 		None => String::new(),
 	};
 
-	let credentials =
-		userinfo.and_then(|userinfo| userinfo.split_once(':')).map(|(user, pwd)| (user.to_owned(), pwd.to_owned()));
+	let credentials = userinfo
+		.and_then(|userinfo| userinfo.split_once(':'))
+		.map(|(user, pwd)| (percent_decode(user), percent_decode(pwd)));
 
 	let query = uri.query().map(|query| format!("?{query}")).unwrap_or_default();
 	let target = format!("{scheme}://{host}{port}{}{query}", uri.path());
 
 	Ok(Target { scheme, target, credentials })
+}
+
+/// Percent-decode `input` into raw bytes.
+///
+/// Malformed escapes (`%` not followed by two hex digits) are kept as-is.
+fn percent_decode(input: &str) -> Vec<u8> {
+	fn hex(b: u8) -> Option<u8> {
+		(b as char).to_digit(16).map(|d| d as u8)
+	}
+
+	let bytes = input.as_bytes();
+	let mut out = Vec::with_capacity(bytes.len());
+	let mut i = 0;
+	while i < bytes.len() {
+		if bytes[i] == b'%' {
+			if let (Some(hi), Some(lo)) =
+				(bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex))
+			{
+				out.push(hi << 4 | lo);
+				i += 3;
+				continue;
+			}
+		}
+		out.push(bytes[i]);
+		i += 1;
+	}
+	out
 }
 
 /// HTTP Transport Client.
@@ -534,6 +560,16 @@ mod tests {
 	}
 
 	#[test]
+	fn percent_decode_works() {
+		assert_eq!(percent_decode("p%40ss"), b"p@ss");
+		assert_eq!(percent_decode("%e2%9C%93"), "✓".as_bytes());
+		// Malformed escapes are kept as-is.
+		assert_eq!(percent_decode("100%"), b"100%");
+		assert_eq!(percent_decode("%4"), b"%4");
+		assert_eq!(percent_decode("%zz"), b"%zz");
+	}
+
+	#[test]
 	fn missing_host_rejected() {
 		let err = HttpTransportClientBuilder::new().build("http:///path").unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
@@ -570,8 +606,13 @@ mod tests {
 	fn credentials_are_moved_to_authorization_header() {
 		let client = HttpTransportClientBuilder::new().build("http://user:p%40ss@localhost:9999/path").unwrap();
 		assert_eq!(&client.target, "http://localhost:9999/path");
-		// base64 of "user:p%40ss"
-		assert_eq!(client.headers[hyper::header::AUTHORIZATION], "Basic dXNlcjpwJTQwc3M=");
+		// base64 of "user:p@ss"
+		assert_eq!(client.headers[hyper::header::AUTHORIZATION], "Basic dXNlcjpwQHNz");
+
+		// Regression test for https://github.com/paritytech/jsonrpsee/issues/1639
+		let client = HttpTransportClientBuilder::new().build("http://%3D:%3D@localhost:9999").unwrap();
+		// base64 of "=:="
+		assert_eq!(client.headers[hyper::header::AUTHORIZATION], "Basic PTo9");
 	}
 
 	#[test]
